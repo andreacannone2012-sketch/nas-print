@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cups cups-client cups-filters cups-ipp-utils \
         ghostscript poppler-utils procps tini \
         printer-driver-brlaser \
+        sane-utils sane-airscan \
         libreoffice-writer libreoffice-impress libreoffice-calc \
         fonts-liberation fonts-dejavu-core \
         fonts-crosextra-carlito fonts-crosextra-caladea \
