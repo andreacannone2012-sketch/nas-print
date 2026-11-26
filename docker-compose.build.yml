@@ -15,6 +15,8 @@ services:
       PRINTER_MODEL: everywhere
       MAX_UPLOAD_MB: "50"
       CONVERT_TIMEOUT: "180"
+      PREVIEW_TTL: "1800"        # secondi di conservazione dell'anteprima di un file non ancora stampato
+      PREVIEW_MAX_MB: "600"      # spazio massimo (in /tmp, cioe' RAM) per le anteprime
     tmpfs:
       - /tmp:size=1g          # file temporanei: spariscono comunque al riavvio
     stop_grace_period: 20s

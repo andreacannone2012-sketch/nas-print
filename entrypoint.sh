@@ -14,7 +14,8 @@ for _ in $(seq 1 30); do
 done
 
 # Un solo worker (la conversione LibreOffice e' serializzata), piu' thread
-gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 4 --timeout 300 \
+# (servono anche per le miniature dell'anteprima, che arrivano a raffica)
+gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 8 --timeout 300 \
   --access-logfile - --error-logfile - app:app &
 APP_PID=$!
 

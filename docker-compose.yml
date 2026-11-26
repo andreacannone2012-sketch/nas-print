@@ -20,6 +20,8 @@ services:
       PRINTER_MODEL: everywhere
       MAX_UPLOAD_MB: "50"
       CONVERT_TIMEOUT: "180"
+      PREVIEW_TTL: "1800"        # secondi di conservazione dell'anteprima di un file non ancora stampato
+      PREVIEW_MAX_MB: "600"      # spazio massimo (in /tmp, cioe' RAM) per le anteprime
     tmpfs:
       - /tmp:size=1g
     stop_grace_period: 20s
@@ -71,5 +73,5 @@ x-casaos:
     en_us: Print documents to your Brother MFC-L2710DN from any device
     it_it: Stampa documenti sulla Brother MFC-L2710DN da qualsiasi dispositivo
   description:
-    en_us: Lightweight web app (Flask + CUPS + LibreOffice) to print PDF, Office, TXT and images to a network printer over IPP.
-    it_it: Web-app leggera (Flask + CUPS + LibreOffice) per stampare PDF, Office, TXT e immagini su una stampante di rete via IPP.
+    en_us: Lightweight web app (Flask + CUPS + LibreOffice) to preview and print PDF, Office, TXT and images to a network printer over IPP.
+    it_it: Web-app leggera (Flask + CUPS + LibreOffice) per vedere l'anteprima e stampare PDF, Office, TXT e immagini su una stampante di rete via IPP.

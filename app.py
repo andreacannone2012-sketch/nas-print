@@ -1,4 +1,5 @@
 """Web-app Flask per stampare su una stampante di rete (Brother MFC-L2710DN) via CUPS/IPP."""
+import json
 import logging
 import os
 import re
@@ -8,11 +9,19 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 from PIL import Image, ImageOps
+
+try:  # foto iPhone (HEIC/HEIF): opzionale, se la libreria manca l'app funziona lo stesso
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIF_OK = True
+except Exception:  # pragma: no cover
+    HEIF_OK = False
 
 # ----------------------------------------------------------------------------
 # Configurazione (variabili d'ambiente)
@@ -24,6 +33,9 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT", "180"))
 WORK_ROOT = Path(os.getenv("WORK_ROOT", "/tmp/printjobs"))
 LO_PROFILE = Path("/tmp/lo_profile")
+PREVIEW_ROOT = WORK_ROOT / "previews"
+PREVIEW_TTL = int(os.getenv("PREVIEW_TTL", "1800"))            # secondi di vita di un'anteprima
+PREVIEW_MAX_MB = int(os.getenv("PREVIEW_MAX_MB", "600"))       # spazio massimo per le anteprime
 
 _parsed = urlparse(PRINTER_URI)
 PRINTER_HOST = _parsed.hostname or "192.168.1.141"
@@ -31,13 +43,17 @@ PRINTER_PORT = _parsed.port or 631
 
 PDF_EXT = {"pdf"}
 IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"}
-OFFICE_EXT = {"doc", "docx", "odt", "rtf", "ppt", "pptx", "odp", "txt"}
+if HEIF_OK:
+    IMAGE_EXT |= {"heic", "heif"}
+OFFICE_EXT = {"doc", "docx", "odt", "rtf", "ppt", "pptx", "odp", "txt", "xls", "xlsx", "ods"}
 ALLOWED_EXT = PDF_EXT | IMAGE_EXT | OFFICE_EXT
 
 SIDES = {"one-sided", "two-sided-long-edge", "two-sided-short-edge"}
 ORIENTATIONS = {"auto": None, "portrait": "3", "landscape": "4"}
 RANGE_RE = re.compile(r"^\d+(-\d+)?(,\d+(-\d+)?)*$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+-\d+$")
+TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+THUMB_WIDTH = {"s": 360, "l": 1100}   # s = miniatura, l = ingrandimento
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("nas-print")
@@ -47,6 +63,9 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024 * 5  # totale ric
 
 _lo_lock = threading.Lock()        # LibreOffice: una conversione alla volta
 _printer_lock = threading.Lock()   # configurazione coda CUPS
+_render_sem = threading.Semaphore(3)  # al massimo 3 rendering di pagina in parallelo
+_job_titles = {}                   # id job CUPS -> nome file (per mostrarlo nella coda)
+_titles_lock = threading.Lock()
 
 
 class AppError(Exception):
@@ -57,6 +76,13 @@ class AppError(Exception):
 
     def __str__(self):
         return self.message
+
+
+def remember_title(job_id, title):
+    with _titles_lock:
+        _job_titles[job_id] = title[:120]
+        while len(_job_titles) > 200:
+            _job_titles.pop(next(iter(_job_titles)))
 
 
 # ----------------------------------------------------------------------------
@@ -186,7 +212,9 @@ def list_jobs():
     for line in r.stdout.splitlines():
         m = re.match(r"^(\S+-\d+)\s+(\S+)\s+(\d+)\s+(.*)$", line.strip())
         if m:
-            jobs.append({"id": m.group(1), "user": m.group(2), "size": int(m.group(3)), "when": m.group(4)})
+            with _titles_lock:
+                title = _job_titles.get(m.group(1))
+            jobs.append({"id": m.group(1), "user": m.group(2), "size": int(m.group(3)), "when": m.group(4), "title": title})
     return jobs
 
 
@@ -242,12 +270,24 @@ def image_to_pdf(src: Path, dst: Path):
         raise AppError(f"Immagine non valida o non leggibile ({e.__class__.__name__}).", 422)
 
 
-def pdf_pages(path: Path) -> int:
+def pdf_info(path: Path):
+    """Ritorna (numero pagine, [[larghezza, altezza] in punti, una per pagina])."""
     r = run(["pdfinfo", str(path)], 30)
     if r.returncode != 0:
         raise AppError("PDF non valido, danneggiato o protetto da password.", 422)
     m = re.search(r"^Pages:\s+(\d+)", r.stdout, re.M)
-    return int(m.group(1)) if m else 0
+    pages = int(m.group(1)) if m else 0
+    sizes = []
+    if pages:
+        r = run(["pdfinfo", "-f", "1", "-l", str(pages), str(path)], 60)
+        dims = {int(n): (float(w), float(h)) for n, w, h in re.findall(r"^Page\s+(\d+)\s+size:\s+([\d.]+)\s+x\s+([\d.]+)", r.stdout, re.M)}
+        rots = {int(n): int(v) for n, v in re.findall(r"^Page\s+(\d+)\s+rot:\s+(\d+)", r.stdout, re.M)}
+        for i in range(1, pages + 1):
+            w, h = dims.get(i, (595.0, 842.0))
+            if rots.get(i, 0) in (90, 270):
+                w, h = h, w
+            sizes.append([round(w, 1), round(h, 1)])
+    return pages, sizes
 
 
 def normalize_ranges(raw, total_pages):
@@ -334,36 +374,52 @@ def submit_print(pdf: Path, title: str, opts, ranges):
     return m.group(1) if m else "?"
 
 
-def process_one(fs, opts):
+def ingest(fs, workdir: Path):
+    """Salva l'upload e lo porta a PDF. Ritorna (pdf, pagine, dimensioni pagine, nome originale)."""
     original = fs.filename or "documento"
     ext = Path(original).suffix.lower().lstrip(".")
-    result = {"filename": original, "ok": False}
+    if ext not in ALLOWED_EXT:
+        raise AppError(f"Formato '.{ext or '?'}' non supportato.", 415)
+    src = workdir / f"input.{ext}"
+    fs.save(src)
+    size = src.stat().st_size
+    if size == 0:
+        raise AppError("Il file e' vuoto.", 422)
+    if size > MAX_UPLOAD_MB * 1024 * 1024:
+        raise AppError(f"Il file supera il limite di {MAX_UPLOAD_MB} MB.", 413)
+
+    if ext in PDF_EXT:
+        pdf = src
+    elif ext in IMAGE_EXT:
+        pdf = workdir / "converted.pdf"
+        image_to_pdf(src, pdf)
+    else:
+        pdf = convert_with_libreoffice(src, workdir)
+
+    pages, sizes = pdf_info(pdf)
+    if pages == 0:
+        raise AppError("Il documento non contiene pagine.", 422)
+    return pdf, pages, sizes, original
+
+
+def print_item(item, opts):
+    """Stampa un documento: o da un'anteprima gia' pronta (token) o da un upload diretto."""
+    original = item["name"]
+    result = {"key": item.get("key"), "filename": original, "ok": False}
     workdir = None
+    preview = None
     try:
-        if ext not in ALLOWED_EXT:
-            raise AppError(f"Formato '.{ext or '?'}' non supportato.", 415)
-        workdir = Path(tempfile.mkdtemp(prefix="job_", dir=WORK_ROOT))
-        src = workdir / f"input.{ext}"
-        fs.save(src)
-        size = src.stat().st_size
-        if size == 0:
-            raise AppError("Il file e' vuoto.", 422)
-        if size > MAX_UPLOAD_MB * 1024 * 1024:
-            raise AppError(f"Il file supera il limite di {MAX_UPLOAD_MB} MB.", 413)
-
-        if ext in PDF_EXT:
-            pdf = src
-        elif ext in IMAGE_EXT:
-            pdf = workdir / "converted.pdf"
-            image_to_pdf(src, pdf)
+        if item.get("token"):
+            preview = preview_dir(item["token"])
+            pdf = preview / "doc.pdf"
+            pages = pdf_info(pdf)[0]
         else:
-            pdf = convert_with_libreoffice(src, workdir)
-
-        pages = pdf_pages(pdf)
-        if pages == 0:
-            raise AppError("Il documento non contiene pagine.", 422)
-        ranges = normalize_ranges(opts["page_ranges"], pages)
+            workdir = Path(tempfile.mkdtemp(prefix="job_", dir=WORK_ROOT))
+            pdf, pages, _sizes, original = ingest(item["fs"], workdir)
+            result["filename"] = original
+        ranges = normalize_ranges(item.get("range"), pages)
         job_id = submit_print(pdf, original, opts, ranges)
+        remember_title(job_id, original)
 
         warning = None
         time.sleep(1.5)
@@ -383,9 +439,13 @@ def process_one(fs, opts):
             message=f"Inviato in stampa (job {job_id}): {selected} pag. x {opts['copies']} copie, circa {sheets} fogli.",
         )
         log.info("Stampa %s -> %s (%d pag, %d copie)", original, job_id, pages, opts["copies"])
+        if preview:
+            shutil.rmtree(preview, ignore_errors=True)  # stampato: l'anteprima non serve piu'
     except AppError as e:
         log.warning("Errore su '%s': %s", original, e.message)
         result["error"] = e.message
+        if e.status == 410:
+            result["expired"] = True
     except Exception:
         log.exception("Errore imprevisto su '%s'", original)
         result["error"] = "Errore interno imprevisto. Controlla i log del container."
@@ -393,6 +453,87 @@ def process_one(fs, opts):
         if workdir:
             shutil.rmtree(workdir, ignore_errors=True)  # pulizia automatica dei temporanei
     return result
+
+
+# ----------------------------------------------------------------------------
+# Anteprime (PDF convertito conservato per un po' + miniature generate a richiesta)
+# ----------------------------------------------------------------------------
+def preview_dir(token) -> Path:
+    if not TOKEN_RE.match(token or ""):
+        raise AppError("Anteprima non valida.", 400)
+    d = PREVIEW_ROOT / token
+    if not (d / "doc.pdf").is_file():
+        raise AppError("Anteprima scaduta: il file va ricaricato.", 410)
+    try:
+        os.utime(d, None)  # accesso recente = non scade
+    except OSError:
+        pass
+    return d
+
+
+def _dir_size(d: Path) -> int:
+    total = 0
+    for f in d.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def gc_previews():
+    """Elimina anteprime scadute e, se serve, le piu' vecchie per restare nel limite di spazio."""
+    now = time.time()
+    entries = []
+    for d in PREVIEW_ROOT.iterdir():
+        try:
+            if d.is_dir():
+                entries.append([d.stat().st_mtime, d, _dir_size(d)])
+        except OSError:
+            continue
+    keep = []
+    for e in entries:
+        if now - e[0] > PREVIEW_TTL:
+            shutil.rmtree(e[1], ignore_errors=True)
+        else:
+            keep.append(e)
+    keep.sort(key=lambda e: e[0])
+    total = sum(e[2] for e in keep)
+    while keep and total > PREVIEW_MAX_MB * 1024 * 1024:
+        _m, d, s = keep.pop(0)
+        shutil.rmtree(d, ignore_errors=True)
+        total -= s
+
+
+def _gc_loop():
+    while True:
+        time.sleep(60)
+        try:
+            gc_previews()
+        except Exception:
+            log.exception("Pulizia anteprime non riuscita")
+
+
+def render_page(d: Path, n: int, size: str):
+    """JPEG della pagina n (1-based) alla risoluzione 's' o 'l'; in cache nella cartella dell'anteprima."""
+    out = d / f"p{n}-{size}.jpg"
+    if out.exists():
+        return out
+    with _render_sem:
+        if out.exists():
+            return out
+        tmp = d / f"t{n}{size}{uuid.uuid4().hex[:8]}"
+        r = run(
+            ["pdftoppm", "-jpeg", "-jpegopt", "quality=82", "-singlefile", "-f", str(n), "-l", str(n),
+             "-scale-to-x", str(THUMB_WIDTH[size]), "-scale-to-y", "-1", str(d / "doc.pdf"), str(tmp)],
+            60,
+        )
+        produced = tmp.with_name(tmp.name + ".jpg")
+        if r.returncode != 0 or not produced.exists():
+            return None
+        produced.replace(out)
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -420,17 +561,91 @@ def api_status():
     return jsonify(printer=printer_status(), jobs=list_jobs())
 
 
+@app.post("/api/preview")
+def api_preview():
+    """Converte il file in PDF (una sola volta) e ne restituisce pagine e dimensioni."""
+    fs = request.files.get("file")
+    if not fs or not fs.filename:
+        return jsonify(error="Nessun file ricevuto."), 400
+    token = uuid.uuid4().hex
+    d = PREVIEW_ROOT / token
+    d.mkdir(parents=True)
+    try:
+        pdf, pages, sizes, original = ingest(fs, d)
+        final = d / "doc.pdf"
+        if pdf != final:
+            pdf.replace(final)
+        for f in d.iterdir():  # via originale e intermedi: servono solo doc.pdf e le miniature
+            if f != final and f.is_file():
+                f.unlink()
+    except AppError as e:
+        shutil.rmtree(d, ignore_errors=True)
+        log.warning("Anteprima fallita per '%s': %s", fs.filename, e.message)
+        return jsonify(error=e.message), e.status
+    except Exception:
+        shutil.rmtree(d, ignore_errors=True)
+        log.exception("Errore imprevisto nell'anteprima di '%s'", fs.filename)
+        return jsonify(error="Errore interno imprevisto. Controlla i log del container."), 500
+    gc_previews()
+    return jsonify(token=token, filename=original, pages=pages, sizes=sizes)
+
+
+@app.get("/api/preview/<token>/page/<int:n>.jpg")
+def api_preview_page(token, n):
+    d = preview_dir(token)
+    size = request.args.get("s", "s")
+    if size not in THUMB_WIDTH:
+        size = "s"
+    if n < 1:
+        return jsonify(error="Pagina non valida."), 400
+    out = render_page(d, n, size)
+    if out is None:
+        return jsonify(error="Pagina non disponibile."), 404
+    resp = send_file(out, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "private, max-age=600"
+    return resp
+
+
+@app.delete("/api/preview/<token>")
+def api_preview_delete(token):
+    if not TOKEN_RE.match(token):
+        return jsonify(error="Anteprima non valida."), 400
+    shutil.rmtree(PREVIEW_ROOT / token, ignore_errors=True)
+    return jsonify(ok=True)
+
+
 @app.post("/api/print")
 def api_print():
+    """Stampa. Due modi: 'jobs' (JSON con token delle anteprime, intervallo per file) oppure 'files' diretti."""
     try:
         opts = parse_options(request.form)
-        files = [f for f in request.files.getlist("files") if f and f.filename]
-        if not files:
-            raise AppError("Nessun file selezionato.")
+        items = []
+        raw = request.form.get("jobs")
+        if raw:
+            try:
+                jobs = json.loads(raw)
+            except ValueError:
+                raise AppError("Elenco dei lavori non valido.")
+            if not isinstance(jobs, list) or not jobs or len(jobs) > 50:
+                raise AppError("Elenco dei lavori non valido.")
+            for j in jobs:
+                if not isinstance(j, dict):
+                    raise AppError("Elenco dei lavori non valido.")
+                items.append({
+                    "key": j.get("key"),
+                    "name": str(j.get("name") or "documento")[:200],
+                    "token": str(j.get("token") or ""),
+                    "range": str(j.get("range") or "").strip(),
+                })
+        else:
+            files = [f for f in request.files.getlist("files") if f and f.filename]
+            if not files:
+                raise AppError("Nessun file selezionato.")
+            items = [{"key": i, "fs": f, "name": f.filename, "range": opts["page_ranges"]} for i, f in enumerate(files)]
         ensure_printer()
     except AppError as e:
         return jsonify(error=e.message), e.status
-    results = [process_one(f, opts) for f in files]
+    results = [print_item(it, opts) for it in items]
     return jsonify(ok=all(r["ok"] for r in results), results=results)
 
 
@@ -450,6 +665,11 @@ def api_cancel_all():
     if r.returncode != 0:
         return jsonify(error=(r.stderr or r.stdout).strip() or "Annullamento non riuscito."), 502
     return jsonify(ok=True)
+
+
+@app.errorhandler(AppError)
+def app_error(e):
+    return jsonify(error=e.message), e.status
 
 
 @app.errorhandler(413)
@@ -478,8 +698,9 @@ def _bootstrap():
 
 
 shutil.rmtree(WORK_ROOT, ignore_errors=True)
-WORK_ROOT.mkdir(parents=True, exist_ok=True)
+PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
 threading.Thread(target=_bootstrap, daemon=True, name="bootstrap").start()
+threading.Thread(target=_gc_loop, daemon=True, name="preview-gc").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
