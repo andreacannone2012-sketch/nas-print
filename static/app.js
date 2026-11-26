@@ -825,20 +825,10 @@
   const clearHistoryBtn = $("#clear-history");
   const historyList = $("#history");
   const historyEmpty = $("#history-empty");
-  const pinSetupBtn = $("#pin-setup");
-  const pinClearBtn = $("#pin-clear");
-  const pinDialog = $("#pin-dialog");
-  const pinInput = $("#pin-input");
-  const pinConfirmBtn = $("#pin-confirm");
-  const pinCloseBtn = $("#pin-close");
-  const pinError = $("#pin-error");
   const scanBtn = $("#scan-btn");
   const scanStatusDiv = $("#scan-status");
   const scanDownloadBtn = $("#scan-download");
-  const scanNote = $("#scan-note");
   let scanInterval = null;
-
-  let hasPin = false;
 
   async function loadHistory() {
     try {
@@ -895,86 +885,30 @@
     loadHistory();
   });
 
-  // ------------------------------------------------------- protezione PIN
-  async function checkPinStatus() {
-    try {
-      const res = await fetch("/api/pin/status").catch(() => ({ ok: false }));
-      hasPin = res.ok;
-      pinSetupBtn.hidden = hasPin;
-      pinClearBtn.hidden = !hasPin;
-    } catch {
-      hasPin = false;
-      pinSetupBtn.hidden = false;
-      pinClearBtn.hidden = true;
-    }
-  }
-
-  pinSetupBtn.addEventListener("click", () => {
-    pinInput.value = "";
-    pinError.hidden = true;
-    pinDialog.showModal();
-  });
-
-  pinConfirmBtn.addEventListener("click", async () => {
-    const pin = pinInput.value;
-    if (pin.length < 4) {
-      pinError.textContent = "Il PIN deve avere almeno 4 caratteri.";
-      pinError.hidden = false;
-      return;
-    }
-    try {
-      const res = await fetch("/api/pin/set", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pin })
-      });
-      const d = await res.json();
-      if (res.ok) {
-        hasPin = true;
-        pinSetupBtn.hidden = true;
-        pinClearBtn.hidden = false;
-        pinDialog.close();
-        showResults([{ ok: true, filename: "PIN", message: "PIN impostato correttamente." }]);
-      } else {
-        pinError.textContent = d.error || "Errore nell'impostazione del PIN.";
-        pinError.hidden = false;
-      }
-    } catch (e) {
-      pinError.textContent = "Impossibile contattare il server.";
-      pinError.hidden = false;
-    }
-  });
-
-  pinCloseBtn.addEventListener("click", () => pinDialog.close());
-  pinClearBtn.addEventListener("click", async () => {
-    await fetch("/api/pin", { method: "DELETE" });
-    hasPin = false;
-    pinSetupBtn.hidden = false;
-    pinClearBtn.hidden = true;
-    showResults([{ ok: true, filename: "PIN", message: "PIN rimosso." }]);
-  });
-
   // ------------------------------------------------------- scansione
+  const scanMsg = $("#scan-token");
+
   scanBtn.addEventListener("click", async () => {
-    scanBtn.hidden = true;
+    const source = (form.querySelector('input[name="scan-source"]:checked') || document.querySelector('input[name="scan-source"]:checked')).value;
+    scanBtn.disabled = true;
     scanStatusDiv.hidden = false;
-    scanStatusDiv.querySelector("#scan-token").textContent = "Avvio scansione...";
     scanDownloadBtn.hidden = true;
-    scanNote.hidden = false;
+    scanMsg.textContent = "Avvio scansione\u2026";
     try {
-      const res = await fetch("/api/scan", { method: "POST" });
+      const body = new FormData();
+      body.append("source", source);
+      const res = await fetch("/api/scan", { method: "POST", body });
       const data = await res.json();
       if (res.ok) {
-        scanStatusDiv.querySelector("#scan-token").textContent = `Token: ${data.token} - In attesa...`;
-        scanStatusDiv.querySelector("#scan-download").textContent = "Download";
+        scanMsg.textContent = "Scansione in corso\u2026";
         startScanPolling(data.token);
       } else {
-        scanStatusDiv.querySelector("#scan-token").textContent = data.error || "Errore nella scansione.";
-        scanBtn.hidden = false;
+        scanMsg.textContent = data.error || "Errore nella scansione.";
+        scanBtn.disabled = false;
       }
     } catch (e) {
-      scanStatusDiv.querySelector("#scan-token").textContent = "Impossibile contattare il server.";
-      scanBtn.hidden = false;
+      scanMsg.textContent = "Impossibile contattare il server.";
+      scanBtn.disabled = false;
     }
   });
 
@@ -983,24 +917,18 @@
     scanInterval = setInterval(async () => {
       try {
         const res = await fetch(`/api/scan/${token}/status`);
-        if (res.ok) {
-          const status = await res.json();
-          const statusDiv = scanStatusDiv;
-          if (status.status === "ready") {
-            clearInterval(scanInterval);
-            scanStatusDiv.querySelector("#scan-token").textContent = `Pronto! Pag: ${status.pages}`;
-            scanDownloadBtn.hidden = false;
-            scanDownloadBtn.onclick = () => {
-              window.open(`/api/scan/${token}/download`, "_blank");
-            };
-            scanDownloadBtn.textContent = "Scarica PDF";
-          } else if (status.status === "error") {
-            clearInterval(scanInterval);
-            scanStatusDiv.querySelector("#scan-token").textContent = status.error || "Errore nella scansione.";
-            scanBtn.hidden = false;
-          } else {
-            scanStatusDiv.querySelector("#scan-token").textContent = `Token: ${token} - Stato: ${status.status}...`;
-          }
+        if (!res.ok) throw new Error("status");
+        const status = await res.json();
+        if (status.status === "ready") {
+          clearInterval(scanInterval);
+          scanMsg.textContent = `Pronto: ${status.pages} ${status.pages === 1 ? "pagina" : "pagine"}.`;
+          scanDownloadBtn.hidden = false;
+          scanDownloadBtn.onclick = () => { window.open(`/api/scan/${token}/download`, "_blank"); };
+          scanBtn.disabled = false;
+        } else if (status.status === "error") {
+          clearInterval(scanInterval);
+          scanMsg.textContent = status.error || "Errore nella scansione.";
+          scanBtn.disabled = false;
         }
       } catch {
         // Continua a pollare
@@ -1016,5 +944,4 @@
   refresh();
   refreshStatus();
   loadHistory();
-  checkPinStatus();
 })();
