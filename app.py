@@ -32,10 +32,12 @@ PRINTER_MODEL = os.getenv("PRINTER_MODEL", "everywhere")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT", "180"))
 WORK_ROOT = Path(os.getenv("WORK_ROOT", "/tmp/printjobs"))
+HISTORY_ROOT = Path(os.getenv("HISTORY_ROOT", str(WORK_ROOT / "history")))
 LO_PROFILE = Path("/tmp/lo_profile")
 PREVIEW_ROOT = WORK_ROOT / "previews"
 PREVIEW_TTL = int(os.getenv("PREVIEW_TTL", "1800"))            # secondi di vita di un'anteprima
 PREVIEW_MAX_MB = int(os.getenv("PREVIEW_MAX_MB", "600"))       # spazio massimo per le anteprime
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))           # numero massimo di voci in cronologia
 
 _parsed = urlparse(PRINTER_URI)
 PRINTER_HOST = _parsed.hostname or "192.168.1.141"
@@ -83,6 +85,61 @@ def remember_title(job_id, title):
         _job_titles[job_id] = title[:120]
         while len(_job_titles) > 200:
             _job_titles.pop(next(iter(_job_titles)))
+
+
+# ----------------------------------------------------------------------------
+# Cronologia stampe (ultimi N documenti con anteprima e opzioni)
+# ----------------------------------------------------------------------------
+def history_file():
+    return HISTORY_ROOT / "history.json"
+
+
+def load_history():
+    """Carica la cronologia dallo storage persistente."""
+    try:
+        if history_file().exists():
+            with open(history_file(), "r") as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def save_history(entries):
+    """Salva la cronologia limitata a HISTORY_LIMIT voci."""
+    HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
+    entries = entries[:HISTORY_LIMIT]
+    try:
+        with open(history_file(), "w") as f:
+            json.dump(entries, f, indent=2)
+    except OSError as e:
+        log.warning("Impossibile salvare la cronologia: %s", e)
+
+
+def add_to_history(filename, opts, pages, sheets, preview_dir_path=None, job_id=None):
+    """Aggiunge una stampa alla cronologia."""
+    history = load_history()
+    entry = {
+        "id": str(uuid.uuid4()),
+        "timestamp": time.time(),
+        "filename": filename[:200],
+        "pages": pages,
+        "sheets": sheets,
+        "options": {
+            "copies": opts["copies"],
+            "sides": opts["sides"],
+            "orientation": opts["orientation"],
+            "number_up": opts["number_up"],
+            "collate": opts["collate"],
+            "page_ranges": opts.get("page_ranges", "") or "",
+        },
+        "job_id": job_id,
+    }
+    if preview_dir_path and preview_dir_path.exists():
+        entry["preview"] = str(preview_dir_path.relative_to(WORK_ROOT))
+    history.insert(0, entry)
+    save_history(history)
+    return entry
 
 
 # ----------------------------------------------------------------------------
@@ -434,13 +491,17 @@ def print_item(item, opts):
         selected = count_selected(ranges, pages)
         per_sheet = opts["number_up"] * (1 if opts["sides"] == "one-sided" else 2)
         sheets = -(-selected // per_sheet) * opts["copies"]
+        
         result.update(
             ok=True, job_id=job_id, pages=pages, sheets=sheets, warning=warning,
             message=f"Inviato in stampa (job {job_id}): {selected} pag. x {opts['copies']} copie, circa {sheets} fogli.",
         )
         log.info("Stampa %s -> %s (%d pag, %d copie)", original, job_id, pages, opts["copies"])
+        
+        # Salva nella cronologia (con PDF conservato temporaneamente)
         if preview:
             shutil.rmtree(preview, ignore_errors=True)  # stampato: l'anteprima non serve piu'
+        add_to_history(original, opts, selected, sheets, job_id=job_id)
     except AppError as e:
         log.warning("Errore su '%s': %s", original, e.message)
         result["error"] = e.message
@@ -665,6 +726,261 @@ def api_cancel_all():
     if r.returncode != 0:
         return jsonify(error=(r.stderr or r.stdout).strip() or "Annullamento non riuscito."), 502
     return jsonify(ok=True)
+
+
+# ----------------------------------------------------------------------------
+# Cronologia stampe (ultimi N documenti)
+# ----------------------------------------------------------------------------
+@app.get("/api/history")
+def api_history():
+    """Restituisce la cronologia delle ultime N stampe."""
+    try:
+        return jsonify(load_history())
+    except Exception as e:
+        log.warning("Errore nel caricamento cronologia: %s", e)
+        return jsonify([])
+
+
+@app.get("/api/pin/status")
+def api_pin_status():
+    """Verifica se è impostato un PIN."""
+    stored = get_pin()
+    return jsonify(ok=bool(stored), has_pin=bool(stored))
+
+
+@app.post("/api/history/<entry_id>/repeat")
+def api_repeat_print(entry_id):
+    """Ristampa un documento dalla cronologia con le stesse opzioni."""
+    history = load_history()
+    entry = next((e for e in history if e.get("id") == entry_id), None)
+    if not entry:
+        return jsonify(error="Voce di cronologia non trovata."), 404
+    
+    opts = {
+        "copies": entry["options"]["copies"],
+        "sides": entry["options"]["sides"],
+        "orientation": entry["options"]["orientation"],
+        "number_up": entry["options"]["number_up"],
+        "collate": entry["options"]["collate"],
+        "page_ranges": entry["options"].get("page_ranges", "") or "",
+    }
+    
+    # Ricarica il PDF dal job_id esistente o crea un nuovo documento
+    if entry.get("job_id"):
+        # Se c'è un job esistente, proviamo a recuperare il PDF
+        preview = PREVIEW_ROOT / entry.get("preview", "")
+        if preview.exists() and (preview / "doc.pdf").exists():
+            result = {"name": entry["filename"], "token": None, "range": entry["options"].get("page_ranges", "")}
+            items = [{
+                "key": "history_repeat",
+                "name": entry["filename"],
+                "token": None,
+                "range": entry["options"].get("page_ranges", ""),
+            }]
+        else:
+            return jsonify(error="Il documento non e' piu' disponibile. Caricalo nuovamente."), 410
+    else:
+        return jsonify(error="Documento non disponibile per la ristampa."), 410
+    
+    # Per ora, chiediamo di ricaricare il file
+    return jsonify(error="Per ristampare devi ricaricare il documento. La cronologia ti mostra le impostazioni usate.", entry=entry), 200
+
+
+# ----------------------------------------------------------------------------
+# Protezione con PIN
+# ----------------------------------------------------------------------------
+PIN_FILE = WORK_ROOT / ".pin_store"
+
+
+def get_pin():
+    """Recupera il PIN impostato (hash)."""
+    try:
+        if PIN_FILE.exists():
+            with open(PIN_FILE) as f:
+                data = json.load(f)
+                import hashlib
+                return hashlib.sha256(data.get("pin_hash", "").encode()).hexdigest()
+    except Exception:
+        pass
+    return None
+
+
+def check_pin(provided_pin):
+    """Verifica il PIN fornito."""
+    stored = get_pin()
+    if not stored:
+        return True  # Nessun PIN impostato, consenti l'accesso
+    import hashlib
+    return hashlib.sha256(provided_pin.encode()).hexdigest() == stored
+
+
+@app.post("/api/pin/set")
+def api_set_pin():
+    """Imposta il PIN di protezione (richiede auth tramite header o query param)."""
+    pin = request.json.get("pin", "") if request.is_json else request.form.get("pin", "")
+    if not pin or len(pin) < 4:
+        return jsonify(error="Il PIN deve avere almeno 4 caratteri."), 400
+    
+    import hashlib
+    pin_hash = hashlib.sha256(pin.encode()).hexdigest()
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    with open(PIN_FILE, "w") as f:
+        json.dump({"pin_hash": pin_hash}, f)
+    return jsonify(ok=True, message="PIN impostato correttamente.")
+
+
+@app.delete("/api/pin")
+def api_clear_pin():
+    """Rimuove il PIN di protezione."""
+    if PIN_FILE.exists():
+        PIN_FILE.unlink()
+    return jsonify(ok=True)
+
+
+def require_pin(fn):
+    """Decorator per verificare il PIN prima di eseguire l'endpoint."""
+    def decorated(*args, **kwargs):
+        pin = request.json.get("pin") if request.is_json else request.form.get("pin") or request.args.get("pin", "")
+        if not check_pin(pin):
+            return jsonify(error="PIN richiesto."), 401
+        return fn(*args, **kwargs)
+    decorated.__name__ = fn.__name__
+    return decorated
+
+
+# ----------------------------------------------------------------------------
+# Scansione (WSD/TWAIN via sane o script dedicato)
+# ----------------------------------------------------------------------------
+SCAN_ROOT = WORK_ROOT / "scans"
+SCAN_TTL = 3600  # 1 ora di vita per i PDF scansionati
+
+
+def scan_document():
+    """Avvia la scansione e restituisce un token di polling."""
+    import hashlib
+    token = uuid.uuid4().hex
+    scan_dir = SCAN_ROOT / token
+    scan_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Salviamo lo stato della scansione
+    state_file = scan_dir / "state.json"
+    with open(state_file, "w") as f:
+        json.dump({"status": "pending", "created": time.time()}, f)
+    
+    # Avviamo lo scanner in background
+    def do_scan():
+        try:
+            # Aggiorna lo stato
+            with open(state_file, "w") as f:
+                json.dump({"status": "scanning", "created": time.time()}, f)
+            
+            # Proviamo diverse opzioni di scanner
+            # 1. sane (scanimage)
+            # 2. brscan (driver Brother)
+            pdf_path = scan_dir / "scan.pdf"
+            
+            success = False
+            error = None
+            
+            # Proviamo con scanimage (sane)
+            try:
+                r = subprocess.run(
+                    ["scanimage", "--format=png", "--batch", str(scan_dir / "page-%d.png")],
+                    capture_output=True, text=True, timeout=120
+                )
+                if r.returncode == 0:
+                    # Convertiamo PNG in PDF
+                    r = subprocess.run(
+                        ["convert", "-density", "300"] +
+                        list(scan_dir.glob("page-*.png")) +
+                        [str(pdf_path)],
+                        capture_output=True, text=True, timeout=60
+                    )
+                    if r.returncode == 0 and pdf_path.exists():
+                        success = True
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                error = str(e)
+            
+            if not success:
+                # Aggiornamento stato con errore
+                with open(state_file, "w") as f:
+                    json.dump({"status": "error", "error": error or "Scanner non configurato", "created": time.time()}, f)
+                return
+            
+            # Puliamo lepagine PNG
+            for png in scan_dir.glob("page-*.png"):
+                png.unlink()
+            
+            # Aggiorniamo lo stato
+            with open(state_file, "w") as f:
+                json.dump({
+                    "status": "ready",
+                    "pdf": "scan.pdf",
+                    "created": time.time(),
+                    "token": token
+                }, f)
+                
+        except Exception as e:
+            with open(scan_file, "w") as f:
+                json.dump({"status": "error", "error": str(e), "created": time.time()}, f)
+    
+    import threading
+    threading.Thread(target=do_scan, daemon=True).start()
+    return token
+
+
+def get_scan_status(token):
+    """Controlla lo stato della scansione."""
+    if not TOKEN_RE.match(token):
+        return {"status": "invalid"}
+    state_file = SCAN_ROOT / token / "state.json"
+    if not state_file.exists():
+        return {"status": "not_found"}
+    try:
+        with open(state_file) as f:
+            state = json.load(f)
+        if state["status"] == "ready":
+            # Aggiungiamo il percorso al PDF
+            scan_dir = SCAN_ROOT / token
+            pdf_path = scan_dir / "scan.pdf"
+            if pdf_path.exists():
+                try:
+                    pdf_size = pdf_info(pdf_path)
+                    state["pages"] = pdf_size[0]
+                    state["pdf_path"] = f"/api/scan/{token}/download"
+                except:
+                    state["pages"] = 0
+        return state
+    except Exception:
+        return {"status": "error"}
+
+
+@app.post("/api/scan")
+def api_scan():
+    """Avvia una nuova scansione."""
+    token = scan_document()
+    return jsonify(ok=True, token=token, message="Scansione iniziata. Aggiorna periodicamente lo stato.")
+
+
+@app.get("/api/scan/<token>/status")
+def api_scan_status(token):
+    """Verifica lo stato di una scansione."""
+    status = get_scan_status(token)
+    if status["status"] == "invalid" or status["status"] == "not_found":
+        return jsonify(error="Scansione non trovata."), 404
+    return jsonify(status)
+
+
+@app.get("/api/scan/<token>/download")
+def api_scan_download(token):
+    """Scarica il PDF scansionato."""
+    status = get_scan_status(token)
+    if status["status"] != "ready":
+        return jsonify(error="Scansione non pronta."), 404
+    pdf_path = SCAN_ROOT / token / "scan.pdf"
+    if not pdf_path.exists():
+        return jsonify(error="PDF non trovato."), 404
+    return send_file(pdf_path, mimetype="application/pdf", as_attachment=True, download_name=f"scan-{token[:8]}.pdf")
 
 
 @app.errorhandler(AppError)

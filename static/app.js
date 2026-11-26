@@ -821,6 +821,193 @@
   setInterval(() => { if (document.visibilityState === "visible") refreshStatus(); }, 10000);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refreshStatus(); });
 
+  // ------------------------------------------------------- cronologia
+  const clearHistoryBtn = $("#clear-history");
+  const historyList = $("#history");
+  const historyEmpty = $("#history-empty");
+  const pinSetupBtn = $("#pin-setup");
+  const pinClearBtn = $("#pin-clear");
+  const pinDialog = $("#pin-dialog");
+  const pinInput = $("#pin-input");
+  const pinConfirmBtn = $("#pin-confirm");
+  const pinCloseBtn = $("#pin-close");
+  const pinError = $("#pin-error");
+  const scanBtn = $("#scan-btn");
+  const scanStatusDiv = $("#scan-status");
+  const scanDownloadBtn = $("#scan-download");
+  const scanNote = $("#scan-note");
+  let scanInterval = null;
+
+  let hasPin = false;
+
+  async function loadHistory() {
+    try {
+      const res = await fetch("/api/history", { cache: "no-store" });
+      const history = await res.json();
+      renderHistory(history);
+    } catch (_) {
+      renderHistory([]);
+    }
+  }
+
+  function renderHistory(history) {
+    historyList.replaceChildren();
+    if (history.length === 0) {
+      historyEmpty.hidden = false;
+      return;
+    }
+    historyEmpty.hidden = true;
+    clearHistoryBtn.hidden = false;
+    history.forEach((entry) => {
+      const li = el("li", "item");
+      const lead = el("span", "lead");
+      lead.appendChild(ic("bookmark"));
+      const txt = el("div", "txt");
+      const date = new Date(entry.timestamp * 1000).toLocaleString();
+      const opts = entry.options;
+      const optsStr = [
+        `${opts.copies} ${opts.copies === 1 ? "copia" : "copie"}`,
+        opts.sides === "one-sided" ? "solo fronte" : opts.sides === "two-sided-long-edge" ? "fronte/retro (lato lungo)" : "fronte/retro (lato corto)",
+        opts.orientation !== "auto" ? (opts.orientation === "portrait" ? "verticale" : "orizzontale") : "auto"
+      ];
+      if (Number(opts.number_up) > 1) optsStr.push(`${opts.number_up} pagine/foglio`);
+      txt.append(
+        el("div", "hl", entry.filename),
+        el("div", "sp", `${date} • ${entry.sheets} fogli • ${optsStr.join(", ")}`)
+      );
+      const repeatBtn = el("button", "text-btn st", "Ristampa");
+      repeatBtn.type = "button";
+      repeatBtn.addEventListener("click", () => repeatPrint(entry.id, entry.options));
+      li.append(lead, txt, repeatBtn);
+      historyList.appendChild(li);
+    });
+  }
+
+  async function repeatPrint(entryId, entryOpts) {
+    showResults([{ ok: true, filename: "Ristampa", message: `Richiedo il file per la voce ${entryId}. Caricalo nuovamente.` }]);
+    // TODO: Implementare recupero PDF da storage permanente o richiedere ricarico
+  }
+
+  clearHistoryBtn.addEventListener("click", async () => {
+    if (!window.confirm("Vuoi davvero cancellare la cronologia?")) return;
+    // Ricarica il file di cronologia e salva vuoto
+    await fetch("/api/history", { method: "DELETE" }).catch(() => {});
+    loadHistory();
+  });
+
+  // ------------------------------------------------------- protezione PIN
+  async function checkPinStatus() {
+    try {
+      const res = await fetch("/api/pin/status").catch(() => ({ ok: false }));
+      hasPin = res.ok;
+      pinSetupBtn.hidden = hasPin;
+      pinClearBtn.hidden = !hasPin;
+    } catch {
+      hasPin = false;
+      pinSetupBtn.hidden = false;
+      pinClearBtn.hidden = true;
+    }
+  }
+
+  pinSetupBtn.addEventListener("click", () => {
+    pinInput.value = "";
+    pinError.hidden = true;
+    pinDialog.showModal();
+  });
+
+  pinConfirmBtn.addEventListener("click", async () => {
+    const pin = pinInput.value;
+    if (pin.length < 4) {
+      pinError.textContent = "Il PIN deve avere almeno 4 caratteri.";
+      pinError.hidden = false;
+      return;
+    }
+    try {
+      const res = await fetch("/api/pin/set", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin })
+      });
+      const d = await res.json();
+      if (res.ok) {
+        hasPin = true;
+        pinSetupBtn.hidden = true;
+        pinClearBtn.hidden = false;
+        pinDialog.close();
+        showResults([{ ok: true, filename: "PIN", message: "PIN impostato correttamente." }]);
+      } else {
+        pinError.textContent = d.error || "Errore nell'impostazione del PIN.";
+        pinError.hidden = false;
+      }
+    } catch (e) {
+      pinError.textContent = "Impossibile contattare il server.";
+      pinError.hidden = false;
+    }
+  });
+
+  pinCloseBtn.addEventListener("click", () => pinDialog.close());
+  pinClearBtn.addEventListener("click", async () => {
+    await fetch("/api/pin", { method: "DELETE" });
+    hasPin = false;
+    pinSetupBtn.hidden = false;
+    pinClearBtn.hidden = true;
+    showResults([{ ok: true, filename: "PIN", message: "PIN rimosso." }]);
+  });
+
+  // ------------------------------------------------------- scansione
+  scanBtn.addEventListener("click", async () => {
+    scanBtn.hidden = true;
+    scanStatusDiv.hidden = false;
+    scanStatusDiv.querySelector("#scan-token").textContent = "Avvio scansione...";
+    scanDownloadBtn.hidden = true;
+    scanNote.hidden = false;
+    try {
+      const res = await fetch("/api/scan", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        scanStatusDiv.querySelector("#scan-token").textContent = `Token: ${data.token} - In attesa...`;
+        scanStatusDiv.querySelector("#scan-download").textContent = "Download";
+        startScanPolling(data.token);
+      } else {
+        scanStatusDiv.querySelector("#scan-token").textContent = data.error || "Errore nella scansione.";
+        scanBtn.hidden = false;
+      }
+    } catch (e) {
+      scanStatusDiv.querySelector("#scan-token").textContent = "Impossibile contattare il server.";
+      scanBtn.hidden = false;
+    }
+  });
+
+  function startScanPolling(token) {
+    if (scanInterval) clearInterval(scanInterval);
+    scanInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/scan/${token}/status`);
+        if (res.ok) {
+          const status = await res.json();
+          const statusDiv = scanStatusDiv;
+          if (status.status === "ready") {
+            clearInterval(scanInterval);
+            scanStatusDiv.querySelector("#scan-token").textContent = `Pronto! Pag: ${status.pages}`;
+            scanDownloadBtn.hidden = false;
+            scanDownloadBtn.onclick = () => {
+              window.open(`/api/scan/${token}/download`, "_blank");
+            };
+            scanDownloadBtn.textContent = "Scarica PDF";
+          } else if (status.status === "error") {
+            clearInterval(scanInterval);
+            scanStatusDiv.querySelector("#scan-token").textContent = status.error || "Errore nella scansione.";
+            scanBtn.hidden = false;
+          } else {
+            scanStatusDiv.querySelector("#scan-token").textContent = `Token: ${token} - Stato: ${status.status}...`;
+          }
+        }
+      } catch {
+        // Continua a pollare
+      }
+    }, 2000);
+  }
+
   // ------------------------------------------------------------------ avvio
   const modeRadio = form.querySelector(`input[name="pvmode"][value="${mode}"]`);
   if (modeRadio) modeRadio.checked = true;
@@ -828,4 +1015,6 @@
   if (last) applySettings(last); else settingsChanged();
   refresh();
   refreshStatus();
+  loadHistory();
+  checkPinStatus();
 })();
