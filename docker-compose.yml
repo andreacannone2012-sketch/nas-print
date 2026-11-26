@@ -1,0 +1,75 @@
+name: nas-print
+
+services:
+  nas-print:
+    # Immagine costruita dalla GitHub Action. Sostituisci OWNER con il tuo utente GitHub (minuscolo).
+    image: ghcr.io/OWNER/nas-print:latest
+    # Alternativa senza Action: costruisce direttamente dal repository GitHub
+    # (commenta "image" e decommenta la riga sotto)
+    # build: https://github.com/OWNER/nas-print.git#main
+    container_name: nas-print
+    restart: unless-stopped
+    pull_policy: always
+    ports:
+      - "5050:8080"            # UI: http://IP_NAS:5050 (la porta 80 e' usata da ZimaOS)
+    environment:
+      TZ: Europe/Rome
+      PRINTER_NAME: Brother_MFC_L2710DN
+      PRINTER_URI: ipp://192.168.1.141/ipp/print
+      # "everywhere" = driverless IPP. Se non va: docker exec nas-print lpinfo -m | grep -i 2710
+      PRINTER_MODEL: everywhere
+      MAX_UPLOAD_MB: "50"
+      CONVERT_TIMEOUT: "180"
+    tmpfs:
+      - /tmp:size=1g
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 40s
+    x-casaos:
+      envs:
+        - container: PRINTER_URI
+          description:
+            en_us: Printer IPP address
+            it_it: Indirizzo IPP della stampante
+        - container: PRINTER_NAME
+          description:
+            en_us: CUPS queue name
+            it_it: Nome della coda CUPS
+        - container: PRINTER_MODEL
+          description:
+            en_us: CUPS driver (everywhere = driverless)
+            it_it: Driver CUPS (everywhere = driverless)
+        - container: MAX_UPLOAD_MB
+          description:
+            en_us: Max upload size per file (MB)
+            it_it: Dimensione massima per file (MB)
+      ports:
+        - container: "8080"
+          description:
+            en_us: Web UI
+            it_it: Interfaccia web
+
+x-casaos:
+  architectures:
+    - amd64
+  main: nas-print
+  author: Self
+  developer: Self
+  category: Utilities
+  icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/cups.png
+  index: /
+  port_map: "5050"
+  scheme: http
+  title:
+    en_us: Network Print
+    it_it: Stampa in rete
+  tagline:
+    en_us: Print documents to your Brother MFC-L2710DN from any device
+    it_it: Stampa documenti sulla Brother MFC-L2710DN da qualsiasi dispositivo
+  description:
+    en_us: Lightweight web app (Flask + CUPS + LibreOffice) to print PDF, Office, TXT and images to a network printer over IPP.
+    it_it: Web-app leggera (Flask + CUPS + LibreOffice) per stampare PDF, Office, TXT e immagini su una stampante di rete via IPP.

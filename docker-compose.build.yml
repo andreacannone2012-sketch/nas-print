@@ -1,0 +1,28 @@
+services:
+  nas-print:
+    build: .
+    image: nas-print:latest
+    container_name: nas-print
+    restart: unless-stopped
+    ports:
+      - "5050:8080"          # UI: http://IP_NAS:5050  (la porta 80 e' usata da ZimaOS)
+    environment:
+      TZ: Europe/Rome
+      PRINTER_NAME: Brother_MFC_L2710DN
+      PRINTER_URI: ipp://192.168.1.141/ipp/print
+      # "everywhere" = driverless IPP. Se non funziona, vedi: lpinfo -m | grep -i 2710
+      # e imposta ad es. PRINTER_MODEL: drv:///brlaser.drv/brl2710dw.ppd (modello da lpinfo)
+      PRINTER_MODEL: everywhere
+      MAX_UPLOAD_MB: "50"
+      CONVERT_TIMEOUT: "180"
+    tmpfs:
+      - /tmp:size=1g          # file temporanei: spariscono comunque al riavvio
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 40s
+    # Se il container non raggiunge la stampante (rete bridge/extender), usa invece:
+    #   network_mode: host   (e rimuovi "ports"; la UI sara' su http://IP_NAS:8080)

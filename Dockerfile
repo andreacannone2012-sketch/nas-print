@@ -1,0 +1,28 @@
+FROM python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8
+
+# CUPS + filtri (pdftopdf, driverless/everywhere), LibreOffice headless, font, strumenti PDF
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cups cups-client cups-filters cups-ipp-utils \
+        ghostscript poppler-utils procps tini \
+        printer-driver-brlaser \
+        libreoffice-writer libreoffice-impress \
+        fonts-liberation fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '\nErrorLog stderr\nAccessLog none\nPageLog none\nBrowsing No\n' >> /etc/cups/cupsd.conf
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
