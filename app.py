@@ -572,6 +572,7 @@ def _gc_loop():
         time.sleep(60)
         try:
             gc_previews()
+            gc_scans()
         except Exception:
             log.exception("Pulizia anteprime non riuscita")
 
@@ -741,13 +742,6 @@ def api_history():
         return jsonify([])
 
 
-@app.get("/api/pin/status")
-def api_pin_status():
-    """Verifica se è impostato un PIN."""
-    stored = get_pin()
-    return jsonify(ok=bool(stored), has_pin=bool(stored))
-
-
 @app.post("/api/history/<entry_id>/repeat")
 def api_repeat_print(entry_id):
     """Ristampa un documento dalla cronologia con le stesse opzioni."""
@@ -787,200 +781,138 @@ def api_repeat_print(entry_id):
 
 
 # ----------------------------------------------------------------------------
-# Protezione con PIN
+# Scansione (eSCL/AirScan via sane-airscan, senza driver proprietari)
 # ----------------------------------------------------------------------------
-PIN_FILE = WORK_ROOT / ".pin_store"
-
-
-def get_pin():
-    """Recupera il PIN impostato (hash)."""
-    try:
-        if PIN_FILE.exists():
-            with open(PIN_FILE) as f:
-                data = json.load(f)
-                import hashlib
-                return hashlib.sha256(data.get("pin_hash", "").encode()).hexdigest()
-    except Exception:
-        pass
-    return None
-
-
-def check_pin(provided_pin):
-    """Verifica il PIN fornito."""
-    stored = get_pin()
-    if not stored:
-        return True  # Nessun PIN impostato, consenti l'accesso
-    import hashlib
-    return hashlib.sha256(provided_pin.encode()).hexdigest() == stored
-
-
-@app.post("/api/pin/set")
-def api_set_pin():
-    """Imposta il PIN di protezione (richiede auth tramite header o query param)."""
-    pin = request.json.get("pin", "") if request.is_json else request.form.get("pin", "")
-    if not pin or len(pin) < 4:
-        return jsonify(error="Il PIN deve avere almeno 4 caratteri."), 400
-    
-    import hashlib
-    pin_hash = hashlib.sha256(pin.encode()).hexdigest()
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    with open(PIN_FILE, "w") as f:
-        json.dump({"pin_hash": pin_hash}, f)
-    return jsonify(ok=True, message="PIN impostato correttamente.")
-
-
-@app.delete("/api/pin")
-def api_clear_pin():
-    """Rimuove il PIN di protezione."""
-    if PIN_FILE.exists():
-        PIN_FILE.unlink()
-    return jsonify(ok=True)
-
-
-def require_pin(fn):
-    """Decorator per verificare il PIN prima di eseguire l'endpoint."""
-    def decorated(*args, **kwargs):
-        pin = request.json.get("pin") if request.is_json else request.form.get("pin") or request.args.get("pin", "")
-        if not check_pin(pin):
-            return jsonify(error="PIN richiesto."), 401
-        return fn(*args, **kwargs)
-    decorated.__name__ = fn.__name__
-    return decorated
-
-
-# ----------------------------------------------------------------------------
-# Scansione (WSD/TWAIN via sane o script dedicato)
-# ----------------------------------------------------------------------------
+SCANNER_URI = os.getenv("SCANNER_URI", f"http://{PRINTER_HOST}/eSCL")
+SCAN_DPI = os.getenv("SCAN_DPI", "300")
+SCAN_TIMEOUT = int(os.getenv("SCAN_TIMEOUT", "240"))
 SCAN_ROOT = WORK_ROOT / "scans"
-SCAN_TTL = 3600  # 1 ora di vita per i PDF scansionati
+SCAN_TTL = int(os.getenv("SCAN_TTL", "3600"))  # vita dei PDF scansionati (secondi)
+SCAN_SOURCES = {"flatbed", "adf"}
+
+_scans = {}                        # token -> stato della scansione
+_scans_lock = threading.Lock()
+_scan_run_lock = threading.Lock()  # lo scanner fa una scansione alla volta
 
 
-def scan_document():
-    """Avvia la scansione e restituisce un token di polling."""
-    import hashlib
-    token = uuid.uuid4().hex
-    scan_dir = SCAN_ROOT / token
-    scan_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Salviamo lo stato della scansione
-    state_file = scan_dir / "state.json"
-    with open(state_file, "w") as f:
-        json.dump({"status": "pending", "created": time.time()}, f)
-    
-    # Avviamo lo scanner in background
-    def do_scan():
-        try:
-            # Aggiorna lo stato
-            with open(state_file, "w") as f:
-                json.dump({"status": "scanning", "created": time.time()}, f)
-            
-            # Proviamo diverse opzioni di scanner
-            # 1. sane (scanimage)
-            # 2. brscan (driver Brother)
-            pdf_path = scan_dir / "scan.pdf"
-            
-            success = False
-            error = None
-            
-            # Proviamo con scanimage (sane)
-            try:
-                r = subprocess.run(
-                    ["scanimage", "--format=png", "--batch", str(scan_dir / "page-%d.png")],
-                    capture_output=True, text=True, timeout=120
-                )
-                if r.returncode == 0:
-                    # Convertiamo PNG in PDF
-                    r = subprocess.run(
-                        ["convert", "-density", "300"] +
-                        list(scan_dir.glob("page-*.png")) +
-                        [str(pdf_path)],
-                        capture_output=True, text=True, timeout=60
-                    )
-                    if r.returncode == 0 and pdf_path.exists():
-                        success = True
-            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-                error = str(e)
-            
-            if not success:
-                # Aggiornamento stato con errore
-                with open(state_file, "w") as f:
-                    json.dump({"status": "error", "error": error or "Scanner non configurato", "created": time.time()}, f)
-                return
-            
-            # Puliamo lepagine PNG
-            for png in scan_dir.glob("page-*.png"):
-                png.unlink()
-            
-            # Aggiorniamo lo stato
-            with open(state_file, "w") as f:
-                json.dump({
-                    "status": "ready",
-                    "pdf": "scan.pdf",
-                    "created": time.time(),
-                    "token": token
-                }, f)
-                
-        except Exception as e:
-            with open(scan_file, "w") as f:
-                json.dump({"status": "error", "error": str(e), "created": time.time()}, f)
-    
-    import threading
-    threading.Thread(target=do_scan, daemon=True).start()
-    return token
-
-
-def get_scan_status(token):
-    """Controlla lo stato della scansione."""
-    if not TOKEN_RE.match(token):
-        return {"status": "invalid"}
-    state_file = SCAN_ROOT / token / "state.json"
-    if not state_file.exists():
-        return {"status": "not_found"}
+def write_sane_config():
+    """Configura sane-airscan con l'indirizzo fisso dello scanner (nel container non c'e' mDNS)."""
     try:
-        with open(state_file) as f:
-            state = json.load(f)
-        if state["status"] == "ready":
-            # Aggiungiamo il percorso al PDF
-            scan_dir = SCAN_ROOT / token
-            pdf_path = scan_dir / "scan.pdf"
-            if pdf_path.exists():
-                try:
-                    pdf_size = pdf_info(pdf_path)
-                    state["pages"] = pdf_size[0]
-                    state["pdf_path"] = f"/api/scan/{token}/download"
-                except:
-                    state["pages"] = 0
-        return state
+        Path("/etc/sane.d").mkdir(parents=True, exist_ok=True)
+        Path("/etc/sane.d/dll.conf").write_text("airscan\n")
+        Path("/etc/sane.d/airscan.conf").write_text(
+            "[options]\ndiscovery = disable\n\n"
+            f'[devices]\n"Brother MFC-L2710DN" = {SCANNER_URI}, eSCL\n'
+        )
+    except OSError as e:
+        log.warning("Impossibile scrivere la configurazione SANE: %s", e)
+
+
+def find_scanner():
+    r = run(["scanimage", "-L"], 40)
+    m = re.search(r"device [`']([^`']+)'", r.stdout)
+    if not m:
+        raise AppError(
+            f"Scanner non trovato su {SCANNER_URI}. Controlla che la stampante sia accesa e raggiungibile "
+            "(prova ad aprire quell'indirizzo + /ScannerCapabilities dal browser)."
+        )
+    return m.group(1)
+
+
+def _set_scan(token, **kw):
+    with _scans_lock:
+        _scans.setdefault(token, {}).update(kw)
+
+
+def _scan_worker(token, source):
+    scan_dir = SCAN_ROOT / token
+    try:
+        with _scan_run_lock:
+            _set_scan(token, status="scanning")
+            dev = find_scanner()
+            cmd = ["scanimage", "-d", dev, "--format=jpeg", "--resolution", SCAN_DPI, "--mode", "Color"]
+            if source == "adf":
+                cmd += ["--source", "ADF", f"--batch={scan_dir}/page-%03d.jpg"]
+            else:
+                cmd += ["-o", str(scan_dir / "page-001.jpg")]
+            r = run(cmd, SCAN_TIMEOUT)
+            pages = sorted(scan_dir.glob("page-*.jpg"))
+            # con l'ADF scanimage esce con errore quando i fogli finiscono: conta solo se ci sono pagine
+            if not pages or (source != "adf" and r.returncode != 0):
+                detail = (r.stderr or r.stdout or "").strip()[-300:]
+                raise AppError("Scansione non riuscita." + (f" Dettaglio: {detail}" if detail else ""), 502)
+            imgs = [Image.open(p) for p in pages]
+            try:
+                imgs = [im if im.mode in ("RGB", "L") else im.convert("RGB") for im in imgs]
+                imgs[0].save(scan_dir / "scan.pdf", "PDF", resolution=float(SCAN_DPI),
+                             save_all=True, append_images=imgs[1:])
+            finally:
+                for im in imgs:
+                    im.close()
+            for p in pages:
+                p.unlink(missing_ok=True)
+        _set_scan(token, status="ready", pages=len(pages))
+        log.info("Scansione %s completata (%d pag)", token[:8], len(pages))
+    except AppError as e:
+        log.warning("Scansione fallita: %s", e.message)
+        _set_scan(token, status="error", error=e.message)
     except Exception:
-        return {"status": "error"}
+        log.exception("Errore imprevisto durante la scansione")
+        _set_scan(token, status="error", error="Errore interno durante la scansione. Controlla i log del container.")
+
+
+def gc_scans():
+    now = time.time()
+    with _scans_lock:
+        old = [t for t, s in _scans.items() if now - s.get("created", now) > SCAN_TTL]
+        for t in old:
+            _scans.pop(t, None)
+    if SCAN_ROOT.exists():
+        for d in SCAN_ROOT.iterdir():
+            try:
+                if d.is_dir() and now - d.stat().st_mtime > SCAN_TTL:
+                    shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
 
 
 @app.post("/api/scan")
 def api_scan():
-    """Avvia una nuova scansione."""
-    token = scan_document()
-    return jsonify(ok=True, token=token, message="Scansione iniziata. Aggiorna periodicamente lo stato.")
+    """Avvia una scansione (source=flatbed|adf) e restituisce un token per il polling."""
+    source = (request.form.get("source") or (request.get_json(silent=True) or {}).get("source") or "flatbed").lower()
+    if source not in SCAN_SOURCES:
+        return jsonify(error="Origine di scansione non valida."), 400
+    if _scan_run_lock.locked():
+        return jsonify(error="Una scansione e' gia' in corso."), 409
+    token = uuid.uuid4().hex
+    (SCAN_ROOT / token).mkdir(parents=True, exist_ok=True)
+    _set_scan(token, status="pending", created=time.time())
+    threading.Thread(target=_scan_worker, args=(token, source), daemon=True, name="scan").start()
+    return jsonify(ok=True, token=token)
 
 
 @app.get("/api/scan/<token>/status")
 def api_scan_status(token):
-    """Verifica lo stato di una scansione."""
-    status = get_scan_status(token)
-    if status["status"] == "invalid" or status["status"] == "not_found":
+    if not TOKEN_RE.match(token):
         return jsonify(error="Scansione non trovata."), 404
-    return jsonify(status)
+    with _scans_lock:
+        state = dict(_scans.get(token) or {})
+    if not state:
+        return jsonify(error="Scansione non trovata."), 404
+    return jsonify(state)
 
 
 @app.get("/api/scan/<token>/download")
 def api_scan_download(token):
-    """Scarica il PDF scansionato."""
-    status = get_scan_status(token)
-    if status["status"] != "ready":
-        return jsonify(error="Scansione non pronta."), 404
+    if not TOKEN_RE.match(token):
+        return jsonify(error="Scansione non trovata."), 404
+    with _scans_lock:
+        state = dict(_scans.get(token) or {})
     pdf_path = SCAN_ROOT / token / "scan.pdf"
-    if not pdf_path.exists():
-        return jsonify(error="PDF non trovato."), 404
-    return send_file(pdf_path, mimetype="application/pdf", as_attachment=True, download_name=f"scan-{token[:8]}.pdf")
+    if state.get("status") != "ready" or not pdf_path.exists():
+        return jsonify(error="Scansione non pronta."), 404
+    return send_file(pdf_path, mimetype="application/pdf", as_attachment=True,
+                     download_name=f"scansione-{token[:8]}.pdf")
 
 
 @app.errorhandler(AppError)
@@ -1015,6 +947,8 @@ def _bootstrap():
 
 shutil.rmtree(WORK_ROOT, ignore_errors=True)
 PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
+SCAN_ROOT.mkdir(parents=True, exist_ok=True)
+write_sane_config()
 threading.Thread(target=_bootstrap, daemon=True, name="bootstrap").start()
 threading.Thread(target=_gc_loop, daemon=True, name="preview-gc").start()
 
