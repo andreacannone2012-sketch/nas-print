@@ -173,19 +173,18 @@
 
   <section class="card">
     <h2>Scansione</h2>
+    <fieldset class="field">
+      <legend>Origine</legend>
+      <div class="seg">
+        <label><input type="radio" name="scan-source" value="flatbed" checked><span><svg class="ic ck" aria-hidden="true"><use href="#i-check"/></svg>Vetro</span></label>
+        <label><input type="radio" name="scan-source" value="adf"><span><svg class="ic ck" aria-hidden="true"><use href="#i-check"/></svg>Caricatore (ADF)</span></label>
+      </div>
+    </fieldset>
     <button id="scan-btn" type="button" class="btn st">Avvia scansione</button>
     <div id="scan-status" class="scan-status" hidden>
       <span id="scan-token"></span>
       <button id="scan-download" type="button" class="btn tonal st" hidden>Scarica PDF</button>
     </div>
-    <p id="scan-note" class="note" hidden>La scansione richiede l'installazione di sane/scanimage o driver specifici per Brother.</p>
-  </section>
-
-  <section class="card">
-    <h2>Protezione con PIN</h2>
-    <p>Richiede PIN per annullare stampe e visualizzare la cronologia.</p>
-    <button id="pin-setup" type="button" class="text-btn st">Imposta PIN</button>
-    <button id="pin-clear" type="button" class="text-btn st err" hidden>Rimuovi PIN</button>
   </section>
 
   <div class="fab-bar">
@@ -209,18 +208,6 @@
   </div>
 </dialog>
 
-<dialog id="pin-dialog" aria-labelledby="pin-title">
-  <div class="lb-head">
-    <h2 id="pin-title">Inserisci PIN</h2>
-    <button type="button" id="pin-close" class="icon-btn st" aria-label="Chiudi"><svg class="ic" aria-hidden="true"><use href="#i-close"/></svg></button>
-  </div>
-  <div class="lb-body">
-    <input id="pin-input" type="password" maxlength="10" placeholder="PIN (minimo 4 caratteri)" autocomplete="off">
-    <button type="button" id="pin-confirm" class="btn st">Conferma</button>
-    <p id="pin-error" class="error" hidden></p>
-  </div>
-</dialog>
-
-<script src="{{ url_for('static', filename='app.js') }}?v=4"></script>
+<script src="{{ url_for('static', filename='app.js') }}?v=5"></script>
 </body>
 </html>
